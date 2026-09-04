@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-gateway"
+version = "0.1.0"
+description = "OpenAI Responses-compatible gateway for the Codex ChatGPT backend"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Jacob Stoner"}]
+keywords = ["codex", "openai", "gateway", "responses-api"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.urls]
+Homepage = "https://github.com/jacobsparts/codex-gateway"
+Repository = "https://github.com/jacobsparts/codex-gateway"
+Issues = "https://github.com/jacobsparts/codex-gateway/issues"
+
+[project.scripts]
+codex-gateway = "server:main"
+codex-auth = "codex_transport.utility.codex_auth:main"
+codex-quota = "codex_transport.utility.codex_quota:main"
+
+[tool.setuptools]
+py-modules = ["server"]
+
+[tool.setuptools.packages.find]
+include = ["codex_transport*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
