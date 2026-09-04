@@ -12,10 +12,10 @@ pool, and includes commands for authentication and quota inspection.
 ## Features
 
 - `POST /v1/responses` with streaming and non-streaming responses
-- `GET /v1/models` for available Codex model slugs
+- `GET /v1/models` for the configured Codex model
 - `GET /v1/usage` for quota information across the credential pool
 - `GET /health` and `GET /healthz` health checks
-- OAuth token refresh and least-used-account rotation
+- OAuth token refresh and reset-aware first-fill account rotation
 - Response reconstruction for the Codex backend's SSE-only protocol
 - `codex-auth` and `codex-quota` command-line utilities
 - Python standard library only at runtime
@@ -82,11 +82,16 @@ codex-auth --remove cred-0
 
 See all options with `codex-auth --help`.
 
-The gateway refreshes expiring access tokens automatically. Writes are
-serialized through `auth.json.lock`, and unknown top-level keys in the pool
-are preserved. An account rejected with HTTP 401 is marked invalid; an account
-receiving HTTP 429 is marked exhausted and the request rotates to another
-usable account.
+The gateway refreshes expiring access tokens automatically. Account selection
+uses reset-aware first-fill rotation: it drains the quota that expires first,
+with lower remaining quota as the tie-breaker. It keeps the final 5% of every
+account in reserve until all accounts have reached that threshold, then uses
+those reserves in the same order.
+
+Writes are serialized through `auth.json.lock`, and unknown top-level keys in
+the pool are preserved. An account rejected during token refresh with HTTP
+401 is marked invalid. HTTP 429 expires the selected account's cached quota so
+the next request refreshes quota before selecting an account.
 
 ## Running the gateway
 
@@ -156,7 +161,7 @@ The installed transport can also be imported directly:
 from codex_transport import codex
 
 response = codex.responses({
-    "model": codex.DEFAULT_MODEL,
+    "model": codex.MODEL,
     "input": [{"role": "user", "content": "Hello"}],
 })
 ```
@@ -174,15 +179,10 @@ The gateway handles several backend-specific details:
 
 - The backend is SSE-only, so buffered responses are assembled from stream
   events while upstream requests force `stream: true` and `store: false`.
-- Terminal events can carry an empty `output`; text, reasoning, messages, and
-  function calls are reconstructed from their event streams.
-- Codex response `phase` metadata is preserved. Clients using native tool calls
-  can distinguish executable calls from commentary without flattening channels.
-- Unsupported Responses parameters are omitted before forwarding.
-- Replayed `function_call` items have rejected fields removed.
-- The large backend-only `usage.attribution` payload is omitted.
-- `x-codex-*` rate-limit headers and the selected account are exposed on
-  completed HTTP responses.
+- Terminal events can carry an empty `output`; text and function calls are
+  reconstructed from their event streams.
+- Unsupported prompt-cache fields are omitted before forwarding.
+- The selected account is exposed on completed buffered HTTP responses.
 
 ## Tests
 

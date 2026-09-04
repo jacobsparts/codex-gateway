@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import time
-import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from codex_transport import codex as transport
@@ -16,7 +15,6 @@ DEFAULT_PORT = int(os.environ.get("CODEX_GATEWAY_PORT", "8932"))
 # Leave unset to accept any (including absent) token; set it to require an exact match.
 GATEWAY_TOKEN = os.environ.get("CODEX_GATEWAY_TOKEN")
 
-_auth = transport.CodexAuth()
 
 def _error(message: str, code: str = "invalid_request_error"):
     return {"error": {"message": message, "type": code, "code": code}}
@@ -57,14 +55,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         if self.path in ("/health", "/healthz"):
-            self._send(200, {"status": "ok", "models": len(_list_models_cached())})
+            self._send(200, {"status": "ok", "models": 1})
             return
         if self.path == "/v1/usage":
             if not self._authorized():
                 return
             try:
-                snapshots = transport.usage(_auth)
-            except Exception as exc:
+                snapshots = _usage(transport.CodexAuth())
+            except transport.CodexError as exc:
                 self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
                 return
             self._send(200, {"object": "list", "data": snapshots})
@@ -72,16 +70,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             if not self._authorized():
                 return
-            try:
-                names = _list_models_cached()
-            except Exception as exc:
-                self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
-                return
             now = int(time.time())
-            data = [
-                {"id": name, "object": "model", "created": now, "owned_by": "codex"}
-                for name in names
-            ]
+            data = [{"id": transport.MODEL, "object": "model", "created": now, "owned_by": "codex"}]
             self._send(200, {"object": "list", "data": data})
             return
         self._send(404, _error(f"unknown path {self.path}", "not_found"))
@@ -100,41 +90,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, _error("body must be a JSON object"))
             return
         if not body.get("model"):
-            body = dict(body, model=transport.DEFAULT_MODEL)
+            body = dict(body, model=transport.MODEL)
 
-        meta: dict = {}
+        auth = transport.CodexAuth()
         try:
             if body.get("stream"):
-                self._stream_response(body, meta)
+                self._stream_response(body, auth)
                 return
-            response = transport.responses(body, auth=_auth, meta=meta)
-        except transport.CredentialInvalidError as exc:
-            self._send(502, _error(f"codex credential rejected: {exc}", "transport_error"))
-            return
-        except transport.RateLimitedError as exc:
-            extra = meta.get("rate_limits") or {}
-            self._send(429, rate_limit_error(exc), extra)
-            return
-        except transport.UpstreamBadRequestError as exc:
-            self._send(400, _error(str(exc)))
-            return
+            response = transport.responses(body, auth=auth)
         except transport.CodexStallError as exc:
             self._send(504, _error(f"codex stream stalled: {exc}", "transport_error"))
             return
         except transport.CodexError as exc:
             self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
             return
-        except Exception as exc:  # noqa: BLE001 - transport raises plain exceptions
-            self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
-            return
-        extra = dict(meta.get("rate_limits") or {})
-        if meta.get("email"):
-            extra["x-codex-account"] = meta["email"]
+        extra = {}
+        if auth.data.get("email"):
+            extra["x-codex-account"] = auth.data["email"]
         self._send(200, response, extra)
 
-    def _stream_response(self, body: dict, meta: dict) -> None:
-        """Forward the upstream SSE stream, repopulating `response.output` at the end."""
-        builder = transport._ResponseBuilder()
+    def _stream_response(self, body: dict, auth: transport.CodexAuth) -> None:
+        """Forward the upstream SSE stream."""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -147,52 +123,31 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
                 self.wfile.flush()
 
-            for event in transport.iter_events(body, auth=_auth, meta=meta):
-                builder.add(event)
-                etype = event.get("type")
-                if etype in ("response.completed", "response.incomplete", "response.failed"):
-                    response = event.get("response")
-                    if isinstance(response, dict) and not response.get("output"):
-                        response["output"] = builder.output()
-                    usage = response.get("usage") if isinstance(response, dict) else None
-                    if isinstance(usage, dict) and "attribution" in usage:
-                        response["usage"] = {k: v for k, v in usage.items() if k != "attribution"}
-                write(event)
-        except transport.CredentialInvalidError as exc:
-            write({"type": "error", "message": f"codex credential rejected: {exc}"})
-        except transport.RateLimitedError as exc:
-            write({"type": "error", "message": f"codex rate limited: {exc}"})
+            transport.responses(body, auth=auth, on_event=write)
         except transport.CodexStallError as exc:
             write({"type": "error", "message": f"codex stream stalled: {exc}"})
         except transport.CodexError as exc:
             write({"type": "error", "message": f"codex transport failed: {exc}"})
-        except (urllib.error.URLError, OSError) as exc:
-            write({"type": "error", "message": f"codex stream failed: {exc}"})
         self.close_connection = True
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("[codex-gateway] %s - %s\n" % (self.address_string(), fmt % args))
 
-def rate_limit_error(exc: Exception) -> dict:
-    return {
-        "error": {
-            "message": str(exc),
-            "type": "rate_limit_error",
-            "code": "rate_limit_exceeded",
-        }
-    }
-
-_MODEL_CACHE: tuple[float, list[str]] | None = None
-
-def _list_models_cached(ttl: float = 300.0) -> list[str]:
-    """Model list is a network call; cache it briefly so /health stays cheap."""
-    global _MODEL_CACHE
-    now = time.time()
-    if _MODEL_CACHE and now - _MODEL_CACHE[0] < ttl:
-        return _MODEL_CACHE[1]
-    names = transport.list_models(_auth)
-    _MODEL_CACHE = (now, names)
-    return names
+def _usage(auth: transport.CodexAuth) -> list[dict]:
+    with auth._lock(transport.fcntl.LOCK_EX):
+        root = auth._load_unlocked()
+        auth._select_loaded(root, 0)
+        snapshots = []
+        for index in range(len(root["credentials"])):
+            auth._usage_request_unlocked(index)
+            credential = root["credentials"][index]
+            snapshots.append({
+                "account": credential.get("account") or f"cred-{index}",
+                "email": credential.get("email"),
+                "rate_limits": credential["rate_limits"],
+            })
+        auth._save_unlocked()
+        return snapshots
 
 def main() -> None:
     server = ThreadingHTTPServer((DEFAULT_HOST, DEFAULT_PORT), Handler)
