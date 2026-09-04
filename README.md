@@ -1,9 +1,8 @@
 # codex-gateway
 
-A lightweight, dependency-free HTTP gateway for the Codex (ChatGPT backend)
-OAuth transport. It exposes an OpenAI Responses API-compatible interface,
-supports streaming and buffered responses, rotates across a local credential
-pool, and includes commands for authentication and quota inspection.
+A pure-Python, OpenAI Responses API-compatible gateway for one or more
+Codex accounts. It includes CLI utilities for signing in, managing accounts,
+and checking quota.
 
 > [!IMPORTANT]
 > This project uses the ChatGPT/Codex OAuth backend. It is unofficial and is
@@ -81,17 +80,6 @@ codex-auth --remove cred-0
 ```
 
 See all options with `codex-auth --help`.
-
-The gateway refreshes expiring access tokens automatically. Account selection
-uses reset-aware first-fill rotation: it drains the quota that expires first,
-with lower remaining quota as the tie-breaker. It keeps the final 5% of every
-account in reserve until all accounts have reached that threshold, then uses
-those reserves in the same order.
-
-Writes are serialized through `auth.json.lock`, and unknown top-level keys in
-the pool are preserved. An account rejected during token refresh with HTTP
-401 is marked invalid. HTTP 429 expires the selected account's cached quota so
-the next request refreshes quota before selecting an account.
 
 ## Running the gateway
 
@@ -182,6 +170,14 @@ The gateway handles several backend-specific details:
 - Terminal events can carry an empty `output`; text and function calls are
   reconstructed from their event streams.
 - Unsupported prompt-cache fields are omitted before forwarding.
+- Expiring access tokens are refreshed automatically.
+- With multiple accounts, reset-aware first-fill rotation uses the quota that
+  expires first, with lower remaining quota as the tie-breaker. The final 5%
+  of each account is held in reserve until every account reaches that level.
+- Credential-file writes are serialized with `auth.json.lock`, and unknown
+  top-level keys are preserved.
+- An account whose token refresh returns HTTP 401 is marked invalid. HTTP 429
+  expires its cached quota so quota is refreshed before the next selection.
 
 ## Tests
 
