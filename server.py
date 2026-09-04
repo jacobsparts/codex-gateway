@@ -22,13 +22,11 @@ def _error(message: str, code: str = "invalid_request_error"):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _send(self, status: int, payload: dict, extra: dict[str, str] | None = None) -> None:
+    def _send(self, status: int, payload: dict) -> None:
         raw = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
-        for name, value in (extra or {}).items():
-            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -104,10 +102,7 @@ class Handler(BaseHTTPRequestHandler):
         except transport.CodexError as exc:
             self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
             return
-        extra = {}
-        if auth.data.get("email"):
-            extra["x-codex-account"] = auth.data["email"]
-        self._send(200, response, extra)
+        self._send(200, response)
 
     def _stream_response(self, body: dict, auth: transport.CodexAuth) -> None:
         """Forward the upstream SSE stream."""

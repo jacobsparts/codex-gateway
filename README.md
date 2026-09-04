@@ -182,7 +182,6 @@ The gateway handles several backend-specific details:
 - Terminal events can carry an empty `output`; text and function calls are
   reconstructed from their event streams.
 - Unsupported prompt-cache fields are omitted before forwarding.
-- The selected account is exposed on completed buffered HTTP responses.
 
 ## Tests
 
