@@ -12,7 +12,7 @@ and checking quota.
 
 - `POST /v1/responses` with streaming and non-streaming responses
 - `GET /v1/models` for the configured Codex model
-- `GET /v1/usage` for quota information across the credential pool
+- `GET /v1/usage` for cached quota and reset information across the credential pool
 - `GET /health` and `GET /healthz` health checks
 - OAuth token refresh and reset-aware first-fill account rotation
 - Response reconstruction for the Codex backend's SSE-only protocol
@@ -116,8 +116,7 @@ codex-gateway
 
 ## Quota
 
-The gateway records Codex rate-limit headers in the credential pool as
-requests complete. Display the latest saved values with:
+With the gateway running, display quota and available manual resets with:
 
 ```bash
 codex-quota
@@ -125,9 +124,19 @@ codex-quota --json
 codex-quota --account ACCOUNT_NAME
 ```
 
-The saved values may be stale until that account serves another request. The
-`GET /v1/usage` endpoint instead queries the upstream usage endpoint for every
-usable account.
+The command asks the gateway to update quota older than five minutes and reset
+information older than one hour, waits for the update to finish, then displays
+the values saved in the local credential pool.
+
+Use a manual quota reset for one account:
+
+```bash
+codex-quota --reset ACCOUNT_NAME
+```
+
+The reset runs immediately. Use an account label or its zero-based `cred-N`
+index. The gateway performs the reset and updates the saved quota and reset
+information before the command displays it.
 
 ## Configuration
 
@@ -137,6 +146,7 @@ usable account.
 | `CODEX_GATEWAY_PORT` | `8932` | Listening port |
 | `CODEX_GATEWAY_TOKEN` | unset | Exact Bearer token required from clients; auth is disabled when unset |
 | `CODEX_GATEWAY_CRED_FILE` | `~/.codex/auth.json` | Shared credential-pool path |
+| `CODEX_GATEWAY_URL` | `http://127.0.0.1:8932` | Gateway URL used by `codex-quota` |
 | `CODEX_ISSUER` | `https://auth.openai.com` | OAuth issuer used by `codex-auth` |
 | `CODEX_CLIENT_ID` | Codex CLI client ID | OAuth client ID used by `codex-auth` |
 | `CODEX_VERSION` | bundled fallback | Codex version advertised by `codex-auth` |

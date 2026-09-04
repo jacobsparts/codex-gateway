@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""codex-quota — Codex quota checker reading ~/.codex/auth.json.
+"""Codex quota display backed by the gateway's local credential cache.
 
-Mirrors `cpa-quota` style (coloured bars, reset countdown) but sources
-data locally without hitting the management API or ChatGPT backend.
-
-Usage:
-    codex-quota [--file PATH] [--json] [--no-color]
-
-Defaults to ~/.codex/auth.json
+The utility asks the local gateway to refresh stale data, waits for that request
+to finish, then renders the quota and reset data persisted in auth.json.
 
 Data source mirrors codex_transport.codex.CodexAuth rate_limits:
     rate_limits = {
@@ -27,11 +22,16 @@ import datetime
 import json
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 import time
 
 DEFAULT_FILE = os.path.expanduser(
     os.environ.get("CODEX_GATEWAY_CRED_FILE", "~/.codex/auth.json")
 )
+DEFAULT_GATEWAY = os.environ.get("CODEX_GATEWAY_URL", "http://127.0.0.1:8932")
+GATEWAY_TOKEN = os.environ.get("CODEX_GATEWAY_TOKEN")
 
 # ── colour helpers ─────────────────────────────────────────────────────────────
 try:
@@ -194,6 +194,35 @@ def label_for_key(key: str) -> str:
     return key
 
 # ── loading ─────────────────────────────────────────────────────────────────────
+def refresh_cache(gateway: str, account: str | None = None, reset: bool = False) -> None:
+    headers = {"Accept": "application/json"}
+    if GATEWAY_TOKEN:
+        headers["Authorization"] = "Bearer " + GATEWAY_TOKEN
+    if reset:
+        request = urllib.request.Request(
+            gateway.rstrip("/") + "/v1/usage/reset",
+            data=json.dumps({"account": account}).encode(),
+            headers={**headers, "Content-Type": "application/json"},
+            method="POST",
+        )
+    else:
+        query = {"resets": "1"}
+        if account:
+            query["account"] = account
+        request = urllib.request.Request(
+            gateway.rstrip("/") + "/v1/usage?" + urllib.parse.urlencode(query),
+            headers=headers,
+        )
+    try:
+        with urllib.request.urlopen(request) as response:
+            json.load(response)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"Gateway returned HTTP {exc.code}: {detail}") from exc
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not refresh quota through {gateway}: {exc}") from exc
+
+
 def load_auth_file(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
@@ -250,6 +279,15 @@ def build_entries(data: dict) -> list[dict]:
         # sort: primary-like first, then by label
         windows.sort(key=lambda w: (0 if "5h" in w["label"] else 1, w["label"]))
 
+        reset_data = cred.get("reset_credits") or {}
+        reset_credits = [
+            credit
+            for credit in reset_data.get("credits", [])
+            if isinstance(credit, dict)
+            and credit.get("status") == "available"
+            and credit.get("reset_type") == "codex_rate_limits"
+        ]
+
         entries.append({
             "index": idx,
             "account": account,
@@ -261,6 +299,8 @@ def build_entries(data: dict) -> list[dict]:
             "last_refresh": cred.get("last_refresh"),
             "fetched_at": fetched_at,
             "fetched_age": fmt_age(fetched_at) if fetched_at else "-",
+            "available_resets": reset_data.get("available_count", len(reset_credits)),
+            "reset_credits": reset_credits,
             "windows": windows,
             "raw": cred,
             "access_exp": info.get("access_exp"),
@@ -282,68 +322,45 @@ def print_section(entries: list[dict]) -> None:
         if email and email != label:
             label = f"{label} ({email})"
         status = red(" [INVALID]") if e.get("invalid") else ""
-        # dim invalid label slightly? keep cyan but add status
-        print(f"\n  {cyan(label)}{status}")
-        # meta lines
-        if e.get("plan"):
-            print(f"    Plan: {bold(e['plan'])}")
-        if e.get("account_id"):
-            print(f"    Account: {dim(e['account_id'])}")
-        if e.get("name"):
-            print(f"    Name: {e['name']}")
-        # last refresh + fetched
-        lr = e.get("last_refresh")
-        if lr:
-            # show reset style age? just ts
-            print(f"    Last refresh: {fmt_ts(lr)}")
+        fetched = ""
         if e.get("fetched_at"):
             stale = ""
-            # mark stale if >1h (mirrors codex._quota_stale)
             try:
                 if time.time() - float(e["fetched_at"]) > 3600:
                     stale = yellow(" (stale >1h)")
             except Exception:
                 pass
-            print(f"    Fetched: {fmt_ts(e['fetched_at'])}  {dim('(' + e['fetched_age'] + ')')}{stale}")
-        # expiry
-        if e.get("access_exp"):
-            # show if token near expiry
-            try:
-                dt = datetime.datetime.fromtimestamp(e["access_exp"], datetime.timezone.utc)
-                delta = dt - datetime.datetime.now(datetime.timezone.utc)
-                mins = int(delta.total_seconds() // 60)
-                if mins < 0:
-                    exp_str = red(f"expired {fmt_remaining(e['access_exp'])} ago")
-                elif mins < 5 + 60*0:  # 5 min window
-                    exp_str = yellow(f"expires in {mins}m")
-                else:
-                    exp_str = dim(fmt_remaining(e["access_exp"]) + " left")
-                print(f"    Token: {exp_str}  {dim('exp ' + fmt_ts(e['access_exp']))}")
-            except Exception:
-                pass
+            fetched = f"  Fetched: {dim(e['fetched_age'])}{stale}"
+        print(
+            f"\n  {cyan(label)}{status}  "
+            f"Plan: {bold(e.get('plan') or 'unknown')}{fetched}"
+        )
+        for number, credit in enumerate(e["reset_credits"], 1):
+            expires_at = credit.get("expires_at")
+            print(f"      Reset {number}: expires {fmt_ts(expires_at)} ({fmt_remaining(expires_at)})")
         if e.get("invalid"):
             print(f"    {red('✗ marked invalid — needs re-auth')}")
             continue
         windows = e.get("windows") or []
         if not windows:
-            print(f"    {dim('(no rate_limits — run a Codex request to populate)')}")
+            print(f"    {dim('(no quota data)')}")
             continue
         for w in windows:
             pct = w.get("remaining_pct")
             reset = w.get("reset") or "-"
             label_w = w.get("label") or w.get("key") or "?"
             pct_str = f"{pct:3d}%" if pct is not None else " --"
-            used = w.get("used_percent")
-            used_str = f" used {used:.1f}%" if used is not None else ""
-            # mirror cpa-quota line: bar pct%  label  reset X  (used Y%)
-            print(f"    {bar(pct)} {pct_str}  {label_w:<20s} reset {reset}{dim(used_str)}")
+            print(f"    {bar(pct)} {pct_str}  {label_w:<20s} reset {reset}")
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Codex quota checker (reads ~/.codex/auth.json, cpa-quota style)")
+    ap = argparse.ArgumentParser(description="Show cached Codex quota after asking the gateway to refresh stale data")
     ap.add_argument("--file", dest="file", default=DEFAULT_FILE, help="path to the pooled auth file (default ~/.codex/auth.json)")
+    ap.add_argument("--gateway", default=DEFAULT_GATEWAY, help="codex-gateway URL")
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--account", default=None, help="show one account by label or cred-N")
+    group.add_argument("--reset", default=None, metavar="ACCOUNT", help="immediately use one manual reset")
     ap.add_argument("--json", dest="json_out", action="store_true", help="output JSON instead of coloured bars")
     ap.add_argument("--no-color", dest="no_color", action="store_true", help="disable ANSI colours")
-    ap.add_argument("--account", dest="account", default=None, help="filter to account name (e.g. openai, openai2)")
     args = ap.parse_args()
 
     global USE_COLOR
@@ -353,14 +370,21 @@ def main() -> None:
     if os.environ.get("NO_COLOR"):
         USE_COLOR = False
 
+    account = args.reset or args.account
+    try:
+        refresh_cache(args.gateway, account=account, reset=args.reset is not None)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     path = os.path.expanduser(args.file)
     data = load_auth_file(path)
     entries = build_entries(data)
 
-    if args.account:
-        entries = [e for e in entries if e["account"] == args.account]
+    if account:
+        entries = [e for e in entries if e["account"] == account or f"cred-{e['index']}" == account]
         if not entries:
-            print(dim(f"No matching account '{args.account}'"), file=sys.stderr)
+            print(dim(f"No matching account '{account}'"), file=sys.stderr)
             sys.exit(1)
 
     if args.json_out:
@@ -373,6 +397,8 @@ def main() -> None:
             "invalid",
             "last_refresh",
             "fetched_at",
+            "available_resets",
+            "reset_credits",
             "windows",
         )
         out = [{key: entry[key] for key in fields} for entry in entries]
