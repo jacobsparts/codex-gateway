@@ -258,6 +258,28 @@ def _effective_quota(credential: dict):
     return None
 
 
+def _manual_reset_expiration(credential: dict) -> int | None:
+    resets = credential.get("reset_credits")
+    credits = resets.get("credits") if isinstance(resets, dict) else None
+    if not isinstance(credits, list):
+        return None
+    now = time.time()
+    expirations = []
+    for credit in credits:
+        if (
+            not isinstance(credit, dict)
+            or credit.get("status") != "available"
+            or credit.get("reset_type") != "codex_rate_limits"
+        ):
+            continue
+        expires_at = credit.get("expires_at")
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+        if isinstance(expires_at, (int, float)) and expires_at > now:
+            expirations.append(int(expires_at))
+    return min(expirations) if expirations else None
+
+
 class CodexAuth:
     def __init__(self, path: str = CRED_FILE):
         self.path = os.path.expanduser(path)
@@ -497,7 +519,9 @@ class CodexAuth:
             if effective is None:
                 continue
             reset_at, remaining = effective
-            key = (reset_at, remaining, index)
+            reset_expiration = _manual_reset_expiration(credential)
+            deadline = min(reset_at, reset_expiration) if reset_expiration is not None else reset_at
+            key = (deadline, remaining, index)
             if remaining > 5:
                 normal.append((key, index))
             elif remaining > 0:
@@ -1034,6 +1058,9 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts, on_event=Non
                 continue
             if exc.code == 429:
                 auth.expire_rate_limits()
+                if attempt == 0:
+                    auth.select_credential(timeout=timeouts.first_byte)
+                    continue
             raise CodexError(f"Codex request failed: HTTP {exc.code}: {detail}") from exc
         except CodexStallError:
             raise

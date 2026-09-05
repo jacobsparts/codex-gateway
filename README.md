@@ -192,9 +192,10 @@ The gateway handles several backend-specific details:
   reconstructed from their event streams.
 - Unsupported prompt-cache fields are omitted before forwarding.
 - Expiring access tokens are refreshed automatically.
-- With multiple accounts, reset-aware first-fill rotation uses the quota that
-  expires first, with lower remaining quota as the tie-breaker. The final 5%
-  of each account is held in reserve until every account reaches that level.
+- With multiple accounts, reset-aware first-fill rotation uses the earliest
+  effective deadline across quota resets and available manual-reset expirations,
+  with lower remaining quota as the tie-breaker. The final 5% of each account
+  is held in reserve until every account reaches that level.
 - Credential-file writes are serialized with `auth.json.lock`, and unknown
   top-level keys are preserved.
 - An account whose token refresh returns HTTP 401 is marked invalid. HTTP 429
