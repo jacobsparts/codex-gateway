@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -20,8 +22,13 @@ DEFAULT_PORT = int(os.environ.get("CODEX_GATEWAY_PORT", "8932"))
 GATEWAY_TOKEN = os.environ.get("CODEX_GATEWAY_TOKEN")
 RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 CONSUME_RESET_URL = RESET_CREDITS_URL + "/consume"
-QUOTA_MAX_AGE = 5 * 60
-RESET_MAX_AGE = 60 * 60
+QUOTA_REFRESH_INTERVAL = 60 * 60
+RESET_REFRESH_INTERVAL = 24 * 60 * 60
+AUTO_RESET_BEFORE = 10 * 60
+MAINTENANCE_INTERVAL = 60
+
+MAINTENANCE_LOCK = threading.Lock()
+REFRESH_TIMERS = {"quota": {}, "resets": {}}
 
 
 def _error(message: str, code: str = "invalid_request_error"):
@@ -69,11 +76,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             query = urllib.parse.parse_qs(parsed.query)
             try:
-                snapshots = _usage(
-                    transport.CodexAuth(),
-                    account=query.get("account", [None])[0],
-                    include_resets=query.get("resets") == ["1"],
-                )
+                account = query.get("account", [None])[0]
+                if query.get("refresh") == ["1"]:
+                    refresh_quota(force=True, account=account)
+                    refresh_reset_credits(force=True, account=account)
+                snapshots = _usage(transport.CodexAuth(), account=account)
             except transport.CodexError as exc:
                 self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
                 return
@@ -100,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, _error("account is required"))
                 return
             try:
-                snapshots = _consume_reset(transport.CodexAuth(), body["account"])
+                snapshots = _consume_reset(body["account"])
             except transport.CodexError as exc:
                 self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
                 return
@@ -163,7 +170,7 @@ def _account_indices(root: dict, account: str | None) -> list[int]:
     raise transport.CodexError(f"Unknown Codex account: {account}")
 
 
-def _reset_request(auth: transport.CodexAuth, url: str, data: bytes | None = None) -> dict:
+def _backend_request(auth: transport.CodexAuth, url: str, data: bytes | None = None) -> dict:
     headers = {
         "Authorization": "Bearer " + auth.access_token,
         "Accept": "application/json",
@@ -180,68 +187,209 @@ def _reset_request(auth: transport.CodexAuth, url: str, data: bytes | None = Non
             return json.load(response)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
-        raise transport.CodexError(f"Reset request failed: HTTP {exc.code}: {detail}") from exc
+        raise transport.CodexError(f"Codex backend request failed: HTTP {exc.code}: {detail}") from exc
     except (OSError, ValueError) as exc:
-        raise transport.CodexError(f"Reset request failed: {exc}") from exc
+        raise transport.CodexError(f"Codex backend request failed: {exc}") from exc
 
 
-def _refresh_resets(auth: transport.CodexAuth, credential: dict) -> None:
-    payload = _reset_request(auth, RESET_CREDITS_URL)
-    credential["reset_credits"] = {
-        "fetched_at": int(time.time()),
-        "available_count": payload.get("available_count", 0),
-        "credits": payload.get("credits", []),
-    }
+def _auth_for_index(index: int) -> transport.CodexAuth:
+    auth = transport.CodexAuth()
+    auth._select_loaded(auth.root, index)
+    if auth.needs_refresh():
+        auth.refresh()
+    return auth
 
 
-def _usage(
-    auth: transport.CodexAuth,
-    account: str | None = None,
-    include_resets: bool = False,
-    force: bool = False,
-) -> list[dict]:
+def _persist_quota(index: int, snapshot: dict, reset_summary) -> None:
+    auth = transport.CodexAuth()
     with auth._lock(transport.fcntl.LOCK_EX):
         root = auth._load_unlocked()
-        indices = _account_indices(root, account)
-        now = time.time()
-        snapshots = []
-        for index in indices:
-            auth._select_loaded(root, index)
-            credential = root["credentials"][index]
-            quota = credential.get("rate_limits")
-            quota_fetched = quota.get("fetched_at", 0) if isinstance(quota, dict) else 0
-            if force or now - quota_fetched > QUOTA_MAX_AGE:
-                auth._usage_request_unlocked(index)
+        credential = root["credentials"][index]
+        credential["rate_limits"] = snapshot
+        if isinstance(reset_summary, dict):
             resets = credential.get("reset_credits")
-            reset_fetched = resets.get("fetched_at", 0) if isinstance(resets, dict) else 0
-            if include_resets and (force or now - reset_fetched > RESET_MAX_AGE):
-                if transport._credential_needs_refresh(credential):
-                    auth._refresh_credential_unlocked(index)
-                _refresh_resets(auth, credential)
+            if not isinstance(resets, dict):
+                resets = {}
+                credential["reset_credits"] = resets
+            for name in ("available_count", "applicable_available_count"):
+                if name in reset_summary:
+                    resets[name] = reset_summary[name]
+        auth._select_loaded(root, index)
+        auth._save_unlocked()
+
+
+def _persist_resets(index: int, payload: dict) -> None:
+    auth = transport.CodexAuth()
+    with auth._lock(transport.fcntl.LOCK_EX):
+        root = auth._load_unlocked()
+        credential = root["credentials"][index]
+        previous = credential.get("reset_credits")
+        resets = {
+            "fetched_at": int(time.time()),
+            "available_count": payload.get("available_count", 0),
+            "credits": payload.get("credits", []),
+        }
+        if isinstance(previous, dict) and "applicable_available_count" in previous:
+            resets["applicable_available_count"] = previous["applicable_available_count"]
+        credential["reset_credits"] = resets
+        auth._select_loaded(root, index)
+        auth._save_unlocked()
+
+
+def _refresh_quota_index(index: int) -> None:
+    auth = _auth_for_index(index)
+    payload = _backend_request(auth, transport.USAGE_URL)
+    snapshot = transport._quota_snapshot_from_usage(payload)
+    if not snapshot["limits"]:
+        raise transport.CodexError("Quota refresh returned no usable rate limits")
+    _persist_quota(index, snapshot, payload.get("rate_limit_reset_credits"))
+
+
+def _refresh_reset_index(index: int) -> None:
+    auth = _auth_for_index(index)
+    _persist_resets(index, _backend_request(auth, RESET_CREDITS_URL))
+
+
+def _refresh_indices(account: str | None) -> list[int]:
+    auth = transport.CodexAuth()
+    indices = _account_indices(auth.root, account)
+    usable = [
+        index
+        for index in indices
+        if auth.root["credentials"][index].get("invalid") is not True
+    ]
+    if account is not None and not usable:
+        raise transport.CodexError(f"Codex account is marked invalid: {account}")
+    return usable
+
+
+def refresh_quota(force: bool = False, account: str | None = None) -> None:
+    with MAINTENANCE_LOCK:
+        auth = transport.CodexAuth()
+        now = time.time()
+        error = None
+        for index in _refresh_indices(account):
+            quota = auth.root["credentials"][index].get("rate_limits")
+            fetched_at = quota.get("fetched_at", 0) if isinstance(quota, dict) else 0
+            last_refresh = max(REFRESH_TIMERS["quota"].get(index, 0), fetched_at)
+            if not force and now - last_refresh < QUOTA_REFRESH_INTERVAL:
+                continue
+            try:
+                _refresh_quota_index(index)
+            except transport.CodexError as exc:
+                error = exc
+                print(f"[codex-gateway] quota refresh failed for credential {index}: {exc}", file=sys.stderr)
+                continue
+            REFRESH_TIMERS["quota"][index] = time.time()
+        if account is not None and error is not None:
+            raise error
+
+
+def _expiry_timestamp(value) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    return None
+
+
+def _consume_reset_index(index: int) -> None:
+    auth = _auth_for_index(index)
+    body = json.dumps({"redeem_request_id": str(uuid.uuid4())}).encode()
+    _backend_request(auth, CONSUME_RESET_URL, body)
+    _refresh_quota_index(index)
+    REFRESH_TIMERS["quota"][index] = time.time()
+    _refresh_reset_index(index)
+    REFRESH_TIMERS["resets"][index] = time.monotonic()
+
+
+def _consume_expiring_resets(indices: list[int]) -> None:
+    auth = transport.CodexAuth()
+    now = time.time()
+    for index in indices:
+        credential = auth.root["credentials"][index]
+        if credential.get("invalid") is True:
+            continue
+        resets = credential.get("reset_credits")
+        if not isinstance(resets, dict) or resets.get("applicable_available_count", 0) < 1:
+            continue
+        for credit in resets.get("credits", []):
+            if not isinstance(credit, dict):
+                continue
+            expires_at = _expiry_timestamp(credit.get("expires_at"))
+            if (
+                credit.get("status") == "available"
+                and credit.get("reset_type") == "codex_rate_limits"
+                and expires_at is not None
+                and now < expires_at <= now + AUTO_RESET_BEFORE
+            ):
+                try:
+                    _consume_reset_index(index)
+                except transport.CodexError as exc:
+                    print(f"[codex-gateway] automatic reset failed for credential {index}: {exc}", file=sys.stderr)
+                break
+
+
+def refresh_reset_credits(force: bool = False, account: str | None = None) -> None:
+    with MAINTENANCE_LOCK:
+        indices = _refresh_indices(account)
+        now = time.monotonic()
+        error = None
+        for index in indices:
+            if not force and now - REFRESH_TIMERS["resets"].get(index, 0.0) < RESET_REFRESH_INTERVAL:
+                continue
+            try:
+                _refresh_reset_index(index)
+            except transport.CodexError as exc:
+                error = exc
+                print(f"[codex-gateway] reset-credit refresh failed for credential {index}: {exc}", file=sys.stderr)
+                continue
+            REFRESH_TIMERS["resets"][index] = time.monotonic()
+        _consume_expiring_resets(indices)
+        if account is not None and error is not None:
+            raise error
+
+
+def _usage(auth: transport.CodexAuth, account: str | None = None) -> list[dict]:
+    with auth._lock(transport.fcntl.LOCK_SH):
+        root = auth._load_unlocked()
+        snapshots = []
+        indices = _account_indices(root, account)
+        for index in indices:
+            credential = root["credentials"][index]
+            if credential.get("invalid") is True:
+                if account is not None:
+                    raise transport.CodexError(f"Codex account is marked invalid: {account}")
+                continue
             snapshots.append({
                 "account": credential.get("account") or f"cred-{index}",
                 "email": credential.get("email"),
                 "rate_limits": credential.get("rate_limits"),
                 "reset_credits": credential.get("reset_credits"),
             })
-        auth._save_unlocked()
         return snapshots
 
 
-def _consume_reset(auth: transport.CodexAuth, account: str) -> list[dict]:
-    with auth._lock(transport.fcntl.LOCK_EX):
-        root = auth._load_unlocked()
-        index = _account_indices(root, account)[0]
-        auth._select_loaded(root, index)
-        if transport._credential_needs_refresh(auth.data):
-            auth._refresh_credential_unlocked(index)
-        body = json.dumps({"redeem_request_id": str(uuid.uuid4())}).encode()
-        _reset_request(auth, CONSUME_RESET_URL, body)
-        auth._save_unlocked()
-    return _usage(auth, account=account, include_resets=True, force=True)
+def _consume_reset(account: str) -> list[dict]:
+    with MAINTENANCE_LOCK:
+        index = _refresh_indices(account)[0]
+        _consume_reset_index(index)
+    return _usage(transport.CodexAuth(), account=account)
+
+
+def _maintenance_loop() -> None:
+    while True:
+        for refresh in (refresh_quota, refresh_reset_credits):
+            try:
+                refresh()
+            except transport.CodexError as exc:
+                print(f"[codex-gateway] maintenance failed: {exc}", file=sys.stderr)
+        time.sleep(MAINTENANCE_INTERVAL)
+
 
 def main() -> None:
     server = ThreadingHTTPServer((DEFAULT_HOST, DEFAULT_PORT), Handler)
+    threading.Thread(target=_maintenance_loop, name="codex-maintenance", daemon=True).start()
     print(
         "codex-gateway listening on http://%s:%d" % (DEFAULT_HOST, DEFAULT_PORT),
         flush=True,

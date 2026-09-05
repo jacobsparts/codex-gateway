@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Codex quota display backed by the gateway's local credential cache.
+"""Display Codex quota and reset data from the local credential cache.
 
-The utility asks the local gateway to refresh stale data, waits for that request
-to finish, then renders the quota and reset data persisted in auth.json.
+Use --refresh to ask the gateway to update both datasets before displaying them.
 
 Data source mirrors codex_transport.codex.CodexAuth rate_limits:
     rate_limits = {
@@ -194,7 +193,7 @@ def label_for_key(key: str) -> str:
     return key
 
 # ── loading ─────────────────────────────────────────────────────────────────────
-def refresh_cache(gateway: str, account: str | None = None, reset: bool = False) -> None:
+def request_gateway(gateway: str, account: str | None = None, reset: bool = False) -> None:
     headers = {"Accept": "application/json"}
     if GATEWAY_TOKEN:
         headers["Authorization"] = "Bearer " + GATEWAY_TOKEN
@@ -206,7 +205,7 @@ def refresh_cache(gateway: str, account: str | None = None, reset: bool = False)
             method="POST",
         )
     else:
-        query = {"resets": "1"}
+        query = {"refresh": "1"}
         if account:
             query["account"] = account
         request = urllib.request.Request(
@@ -244,7 +243,7 @@ def load_auth_file(path: str) -> dict:
 def build_entries(data: dict) -> list[dict]:
     entries = []
     for idx, cred in enumerate(data.get("credentials") or []):
-        if not isinstance(cred, dict):
+        if not isinstance(cred, dict) or cred.get("invalid") is True:
             continue
         account = cred.get("account") or f"cred-{idx}"
         info = _extract_account_info(cred)
@@ -295,7 +294,6 @@ def build_entries(data: dict) -> list[dict]:
             "plan": info.get("plan"),
             "account_id": info.get("account_id"),
             "name": info.get("name"),
-            "invalid": bool(cred.get("invalid")),
             "last_refresh": cred.get("last_refresh"),
             "fetched_at": fetched_at,
             "fetched_age": fmt_age(fetched_at) if fetched_at else "-",
@@ -321,7 +319,6 @@ def print_section(entries: list[dict]) -> None:
         email = e.get("email")
         if email and email != label:
             label = f"{label} ({email})"
-        status = red(" [INVALID]") if e.get("invalid") else ""
         fetched = ""
         if e.get("fetched_at"):
             stale = ""
@@ -332,15 +329,12 @@ def print_section(entries: list[dict]) -> None:
                 pass
             fetched = f"  Fetched: {dim(e['fetched_age'])}{stale}"
         print(
-            f"\n  {cyan(label)}{status}  "
+            f"\n  {cyan(label)}  "
             f"Plan: {bold(e.get('plan') or 'unknown')}{fetched}"
         )
         for number, credit in enumerate(e["reset_credits"], 1):
             expires_at = credit.get("expires_at")
             print(f"      Reset {number}: expires {fmt_ts(expires_at)} ({fmt_remaining(expires_at)})")
-        if e.get("invalid"):
-            print(f"    {red('✗ marked invalid — needs re-auth')}")
-            continue
         windows = e.get("windows") or []
         if not windows:
             print(f"    {dim('(no quota data)')}")
@@ -353,12 +347,13 @@ def print_section(entries: list[dict]) -> None:
             print(f"    {bar(pct)} {pct_str}  {label_w:<20s} reset {reset}")
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Show cached Codex quota after asking the gateway to refresh stale data")
+    ap = argparse.ArgumentParser(description="Show locally cached Codex quota and reset credits")
     ap.add_argument("--file", dest="file", default=DEFAULT_FILE, help="path to the pooled auth file (default ~/.codex/auth.json)")
     ap.add_argument("--gateway", default=DEFAULT_GATEWAY, help="codex-gateway URL")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--account", default=None, help="show one account by label or cred-N")
     group.add_argument("--reset", default=None, metavar="ACCOUNT", help="immediately use one manual reset")
+    ap.add_argument("--refresh", action="store_true", help="ask the gateway to refresh quota and reset credits before displaying them")
     ap.add_argument("--json", dest="json_out", action="store_true", help="output JSON instead of coloured bars")
     ap.add_argument("--no-color", dest="no_color", action="store_true", help="disable ANSI colours")
     args = ap.parse_args()
@@ -371,11 +366,12 @@ def main() -> None:
         USE_COLOR = False
 
     account = args.reset or args.account
-    try:
-        refresh_cache(args.gateway, account=account, reset=args.reset is not None)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    if args.refresh or args.reset is not None:
+        try:
+            request_gateway(args.gateway, account=account, reset=args.reset is not None)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     path = os.path.expanduser(args.file)
     data = load_auth_file(path)
@@ -394,7 +390,6 @@ def main() -> None:
             "email",
             "plan",
             "account_id",
-            "invalid",
             "last_refresh",
             "fetched_at",
             "available_resets",

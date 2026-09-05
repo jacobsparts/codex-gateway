@@ -116,7 +116,8 @@ codex-gateway
 
 ## Quota
 
-With the gateway running, display quota and available manual resets with:
+Display the quota and available manual resets saved in the local credential
+pool:
 
 ```bash
 codex-quota
@@ -124,9 +125,13 @@ codex-quota --json
 codex-quota --account ACCOUNT_NAME
 ```
 
-The command asks the gateway to update quota older than five minutes and reset
-information older than one hour, waits for the update to finish, then displays
-the values saved in the local credential pool.
+By default, the command reads only local state and does not require the gateway
+to be running. Ask the gateway to refresh both quota and reset-credit data
+before displaying it with:
+
+```bash
+codex-quota --refresh
+```
 
 Use a manual quota reset for one account:
 
@@ -137,6 +142,12 @@ codex-quota --reset ACCOUNT_NAME
 The reset runs immediately. Use an account label or its zero-based `cred-N`
 index. The gateway performs the reset and updates the saved quota and reset
 information before the command displays it.
+
+While running, the gateway refreshes quota when it has not been updated by request
+activity for one hour, and refreshes reset-credit data daily in a background
+maintenance thread. An available reset that expires
+within ten minutes is applied automatically, then the account's quota and reset
+information are refreshed immediately.
 
 ## Configuration
 
@@ -188,6 +199,9 @@ The gateway handles several backend-specific details:
   top-level keys are preserved.
 - An account whose token refresh returns HTTP 401 is marked invalid. HTTP 429
   expires its cached quota so quota is refreshed before the next selection.
+- Background maintenance refreshes quota and reset credits without delaying
+  Responses API requests, and automatically uses available resets within ten
+  minutes of expiry.
 
 ## Tests
 
