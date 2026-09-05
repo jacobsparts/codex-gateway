@@ -25,6 +25,7 @@ CONSUME_RESET_URL = RESET_CREDITS_URL + "/consume"
 QUOTA_REFRESH_INTERVAL = 60 * 60
 RESET_REFRESH_INTERVAL = 24 * 60 * 60
 AUTO_RESET_BEFORE = 10 * 60
+AUTO_RESET_MIN_QUOTA_RESET = 24 * 60 * 60
 MAINTENANCE_INTERVAL = 60
 
 MAINTENANCE_LOCK = threading.Lock()
@@ -303,31 +304,155 @@ def _consume_reset_index(index: int) -> None:
     REFRESH_TIMERS["resets"][index] = time.monotonic()
 
 
-def _consume_expiring_resets(indices: list[int]) -> None:
-    auth = transport.CodexAuth()
-    now = time.time()
+def _available_resets(credential: dict, now: float) -> list[float]:
+    resets = credential.get("reset_credits")
+    if not isinstance(resets, dict):
+        return []
+    expirations = []
+    for credit in resets.get("credits", []):
+        if not isinstance(credit, dict):
+            continue
+        expires_at = _expiry_timestamp(credit.get("expires_at"))
+        if (
+            credit.get("status") == "available"
+            and credit.get("reset_type") == "codex_rate_limits"
+            and expires_at is not None
+            and expires_at > now
+        ):
+            expirations.append(expires_at)
+    return expirations
+
+
+def _longest_quota_window(credential: dict):
+    quota = credential.get("rate_limits")
+    limits = quota.get("limits") if isinstance(quota, dict) else None
+    if not isinstance(limits, dict):
+        return None
+    windows = []
+    for name, limit in limits.items():
+        if not name.startswith("codex_") or not isinstance(limit, dict):
+            continue
+        duration = limit.get("limit_window_seconds")
+        used_percent = limit.get("used_percent")
+        if isinstance(duration, (int, float)) and isinstance(used_percent, (int, float)):
+            windows.append((float(duration), 100.0 - float(used_percent)))
+    return max(windows) if windows else None
+
+
+def _depleted_pool_reset_candidate(
+    root: dict,
+    indices: list[int],
+    now: float,
+    require_applicable: bool = False,
+) -> int | None:
+    if not indices:
+        return None
+    credentials = root["credentials"]
     for index in indices:
-        credential = auth.root["credentials"][index]
-        if credential.get("invalid") is True:
-            continue
+        longest = _longest_quota_window(credentials[index])
+        if longest is None or longest[1] > 5:
+            return None
+
+    candidates = []
+    for index in indices:
+        credential = credentials[index]
         resets = credential.get("reset_credits")
-        if not isinstance(resets, dict) or resets.get("applicable_available_count", 0) < 1:
+        if (
+            require_applicable
+            and (not isinstance(resets, dict) or resets.get("applicable_available_count", 0) < 1)
+        ):
             continue
-        for credit in resets.get("credits", []):
-            if not isinstance(credit, dict):
-                continue
-            expires_at = _expiry_timestamp(credit.get("expires_at"))
-            if (
-                credit.get("status") == "available"
-                and credit.get("reset_type") == "codex_rate_limits"
-                and expires_at is not None
-                and now < expires_at <= now + AUTO_RESET_BEFORE
-            ):
-                try:
-                    _consume_reset_index(index)
-                except transport.CodexError as exc:
-                    print(f"[codex-gateway] automatic reset failed for credential {index}: {exc}", file=sys.stderr)
-                break
+        effective = transport._effective_quota(credential)
+        if effective is None or effective[0] <= now + AUTO_RESET_MIN_QUOTA_RESET:
+            continue
+        for expires_at in _available_resets(credential, now):
+            candidates.append((expires_at, index))
+    return min(candidates)[1] if candidates else None
+
+
+def _consume_automatic_reset(indices: list[int]) -> None:
+    auth = transport.CodexAuth()
+    indices = [index for index in indices if auth.root["credentials"][index].get("invalid") is not True]
+    now = time.time()
+    expiring = sorted(
+        (expires_at, index)
+        for index in indices
+        for expires_at in _available_resets(auth.root["credentials"][index], now)
+        if expires_at <= now + AUTO_RESET_BEFORE
+    )
+    for _, index in expiring:
+        try:
+            _refresh_quota_index(index)
+            REFRESH_TIMERS["quota"][index] = time.time()
+            _refresh_reset_index(index)
+            REFRESH_TIMERS["resets"][index] = time.monotonic()
+        except transport.CodexError as exc:
+            print(f"[codex-gateway] automatic reset refresh failed for credential {index}: {exc}", file=sys.stderr)
+            continue
+        credential = transport.CodexAuth().root["credentials"][index]
+        resets = credential.get("reset_credits")
+        if (
+            isinstance(resets, dict)
+            and resets.get("applicable_available_count", 0) > 0
+            and any(
+                expires_at <= time.time() + AUTO_RESET_BEFORE
+                for expires_at in _available_resets(credential, time.time())
+            )
+        ):
+            try:
+                _consume_reset_index(index)
+            except transport.CodexError as exc:
+                print(f"[codex-gateway] automatic reset failed for credential {index}: {exc}", file=sys.stderr)
+            return
+
+    candidate = _depleted_pool_reset_candidate(auth.root, indices, now)
+    if candidate is None:
+        return
+
+    quota_current = True
+    for index in indices:
+        try:
+            _refresh_quota_index(index)
+        except transport.CredentialInvalidError:
+            continue
+        except transport.CodexError as exc:
+            quota_current = False
+            print(f"[codex-gateway] automatic reset quota refresh failed for credential {index}: {exc}", file=sys.stderr)
+            continue
+        REFRESH_TIMERS["quota"][index] = time.time()
+    if not quota_current:
+        return
+
+    auth = transport.CodexAuth()
+    indices = [index for index in indices if auth.root["credentials"][index].get("invalid") is not True]
+    candidate = _depleted_pool_reset_candidate(
+        auth.root,
+        indices,
+        time.time(),
+        require_applicable=True,
+    )
+    if candidate is None:
+        return
+    try:
+        _refresh_reset_index(candidate)
+    except transport.CodexError as exc:
+        print(f"[codex-gateway] automatic reset credit refresh failed for credential {candidate}: {exc}", file=sys.stderr)
+        return
+    REFRESH_TIMERS["resets"][candidate] = time.monotonic()
+
+    auth = transport.CodexAuth()
+    indices = [index for index in indices if auth.root["credentials"][index].get("invalid") is not True]
+    if _depleted_pool_reset_candidate(
+        auth.root,
+        indices,
+        time.time(),
+        require_applicable=True,
+    ) != candidate:
+        return
+    try:
+        _consume_reset_index(candidate)
+    except transport.CodexError as exc:
+        print(f"[codex-gateway] automatic reset failed for credential {candidate}: {exc}", file=sys.stderr)
 
 
 def refresh_reset_credits(force: bool = False, account: str | None = None) -> None:
@@ -345,7 +470,7 @@ def refresh_reset_credits(force: bool = False, account: str | None = None) -> No
                 print(f"[codex-gateway] reset-credit refresh failed for credential {index}: {exc}", file=sys.stderr)
                 continue
             REFRESH_TIMERS["resets"][index] = time.monotonic()
-        _consume_expiring_resets(indices)
+        _consume_automatic_reset(indices)
         if account is not None and error is not None:
             raise error
 

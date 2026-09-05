@@ -145,9 +145,12 @@ information before the command displays it.
 
 While running, the gateway refreshes quota when it has not been updated by request
 activity for one hour, and refreshes reset-credit data daily in a background
-maintenance thread. An available reset that expires
-within ten minutes is applied automatically, then the account's quota and reset
-information are refreshed immediately.
+maintenance thread. An applicable reset is used automatically when it expires within
+ten minutes. The gateway also uses the earliest-expiring applicable reset when every
+usable account has 5% or less remaining in its longest-duration quota window and the
+reset's account is more than 24 hours from its effective quota reset. The gateway
+refreshes and rechecks the relevant quota and reset data before using a reset, then
+refreshes that account's state again afterward.
 
 ## Configuration
 
@@ -198,11 +201,14 @@ The gateway handles several backend-specific details:
   is held in reserve until every account reaches that level.
 - Credential-file writes are serialized with `auth.json.lock`, and unknown
   top-level keys are preserved.
-- An account whose token refresh returns HTTP 401 is marked invalid. HTTP 429
-  expires its cached quota so quota is refreshed before the next selection.
+- An account whose token refresh returns HTTP 401 is marked invalid. On HTTP 429,
+  the gateway expires that account's cached quota, selects again, and retries the
+  request once on another available account.
 - Background maintenance refreshes quota and reset credits without delaying
-  Responses API requests, and automatically uses available resets within ten
-  minutes of expiry.
+  Responses API requests. It uses applicable resets near expiry and, when every
+  usable account's longest-duration quota window reaches its final 5%, uses the
+  earliest-expiring applicable reset for an account whose effective quota reset is
+  more than 24 hours away. Live state is rechecked before a reset is consumed.
 
 ## Tests
 

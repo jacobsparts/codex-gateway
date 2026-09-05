@@ -192,10 +192,14 @@ def _quota_snapshot_from_event(event: dict, fetched_at: int | None = None) -> di
             used_percent = window.get("used_percent")
             reset_at = window.get("reset_at")
             if isinstance(used_percent, (int, float)) and isinstance(reset_at, (int, float)):
-                limits[f"{prefix}_{window_name}"] = {
+                limit = {
                     "used_percent": float(used_percent),
                     "reset_at": int(reset_at),
                 }
+                window_minutes = window.get("window_minutes")
+                if isinstance(window_minutes, (int, float)):
+                    limit["limit_window_seconds"] = int(window_minutes * 60)
+                limits[f"{prefix}_{window_name}"] = limit
     return {
         "fetched_at": int(time.time()) if fetched_at is None else int(fetched_at),
         "limits": limits,
@@ -213,10 +217,14 @@ def _add_usage_windows(limits: dict, prefix: str, details) -> None:
         reset_at = window.get("reset_at")
         if isinstance(used_percent, (int, float)) and isinstance(reset_at, (int, float)):
             suffix = window_name.removesuffix("_window")
-            limits[f"{prefix}_{suffix}"] = {
+            limit = {
                 "used_percent": float(used_percent),
                 "reset_at": int(reset_at),
             }
+            window_seconds = window.get("limit_window_seconds")
+            if isinstance(window_seconds, (int, float)):
+                limit["limit_window_seconds"] = int(window_seconds)
+            limits[f"{prefix}_{suffix}"] = limit
 
 
 def _quota_snapshot_from_usage(payload: dict, fetched_at: int | None = None) -> dict:
