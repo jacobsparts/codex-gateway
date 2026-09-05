@@ -220,6 +220,15 @@ python -m pytest -q
 The test suite is offline; it does not use real credentials or contact the
 Codex backend.
 
+## Related Projects
+
+Part of a family of developer tools for agentic coding and model gateways:
+
+- **[Code Agent](https://github.com/jacobsparts/code-agent)** — A Python REPL-native coding agent designed around lean context, persistent execution state, and infinite context via lossless turn coalescing.
+- **[AgentLib](https://github.com/jacobsparts/agentlib)** — A lightweight, production-proven library for building and shipping LLM agents quickly, where composable agents are defined as Python classes—making it both simple and powerful.
+- **[codex-gateway](https://github.com/jacobsparts/codex-gateway)** — Pure-Python OpenAI Responses API-compatible gateway for Codex/ChatGPT OAuth accounts with quota management, account rotation, and automated resets.
+- **[cursor-gateway](https://github.com/jacobsparts/cursor-gateway)** — Pure-Python OpenAI-compatible Chat Completions gateway that wraps the Cursor Agent API with synthetic checkpoints to provide real native tool calling and cache-friendly session routing.
+
 ## License
 
 [MIT](LICENSE)
