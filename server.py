@@ -90,8 +90,26 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/models":
             if not self._authorized():
                 return
-            now = int(time.time())
-            data = [{"id": transport.MODEL, "object": "model", "created": now, "owned_by": "codex"}]
+            try:
+                indices = _refresh_indices(None)
+                if not indices:
+                    raise transport.CodexError("No usable Codex credentials")
+                auth = _auth_for_index(indices[0])
+                payload = _backend_request(
+                    auth,
+                    f"{transport.MODELS_URL}?client_version={transport.CLIENT_VERSION}",
+                )
+                now = int(time.time())
+                data = [
+                    {"id": model["slug"], "object": "model", "created": now, "owned_by": "codex"}
+                    for model in payload.get("models") or []
+                    if isinstance(model, dict)
+                    and model.get("visibility") == "list"
+                    and model.get("slug")
+                ]
+            except transport.CodexError as exc:
+                self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+                return
             self._send(200, {"object": "list", "data": data})
             return
         self._send(404, _error(f"unknown path {self.path}", "not_found"))

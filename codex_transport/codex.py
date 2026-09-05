@@ -25,6 +25,7 @@ CRED_FILE = os.path.expanduser(os.environ.get("CODEX_GATEWAY_CRED_FILE", "~/.cod
 REFRESH_URL = "https://auth.openai.com/oauth/token"
 RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLIENT_VERSION = "0.146.0"
 MODEL = "gpt-5.6-luna"

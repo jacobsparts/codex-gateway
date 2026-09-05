@@ -11,7 +11,7 @@ and checking quota.
 ## Features
 
 - `POST /v1/responses` with streaming and non-streaming responses
-- `GET /v1/models` for the configured Codex model
+- `GET /v1/models` for available Codex models
 - `GET /v1/usage` for cached quota and reset information across the credential pool
 - `GET /health` and `GET /healthz` health checks
 - OAuth token refresh and reset-aware first-fill account rotation
