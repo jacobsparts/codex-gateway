@@ -530,9 +530,35 @@ def _maintenance_loop() -> None:
         time.sleep(MAINTENANCE_INTERVAL)
 
 
+def _stagger_loop() -> None:
+    while True:
+        usable = _refresh_indices(None)
+        if not usable:
+            time.sleep(60)
+            continue
+
+        interval = (5 * 3600) / len(usable)
+
+        for index in usable:
+            time.sleep(interval)
+            try:
+                auth = _auth_for_index(index)
+                payload = json.dumps({
+                    "model": transport.MODEL,
+                    "input": [{"role": "user", "content": "Reply only 'ok'"}],
+                    "max_output_tokens": 1,
+                    "stream": False,
+                    "store": False,
+                }).encode()
+                _backend_request(auth, transport.RESPONSES_URL, data=payload)
+            except Exception as exc:
+                print(f"[codex-gateway] stagger ping failed for credential {index}: {exc}", file=sys.stderr)
+
+
 def main() -> None:
     server = ThreadingHTTPServer((DEFAULT_HOST, DEFAULT_PORT), Handler)
     threading.Thread(target=_maintenance_loop, name="codex-maintenance", daemon=True).start()
+    threading.Thread(target=_stagger_loop, name="codex-stagger", daemon=True).start()
     print(
         "codex-gateway listening on http://%s:%d" % (DEFAULT_HOST, DEFAULT_PORT),
         flush=True,

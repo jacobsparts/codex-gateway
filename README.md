@@ -15,6 +15,7 @@ and checking quota.
 - `GET /v1/usage` for cached quota and reset information across the credential pool
 - `GET /health` and `GET /healthz` health checks
 - OAuth token refresh and reset-aware first-fill account rotation
+- Background round-robin pings to keep multi-account quota resets staggered
 - Response reconstruction for the Codex backend's SSE-only protocol
 - `codex-auth` and `codex-quota` command-line utilities
 - Python standard library only at runtime
