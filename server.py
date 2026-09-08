@@ -546,11 +546,17 @@ def _stagger_loop() -> None:
                 payload = json.dumps({
                     "model": transport.MODEL,
                     "input": [{"role": "user", "content": "Reply only 'ok'"}],
-                    "max_output_tokens": 1,
-                    "stream": False,
+                    "stream": True,
                     "store": False,
                 }).encode()
-                _backend_request(auth, transport.RESPONSES_URL, data=payload)
+                req = urllib.request.Request(
+                    transport.RESPONSES_URL,
+                    data=payload,
+                    headers=transport._headers(auth),
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    transport._parse_http_response(resp, auth=auth)
             except Exception as exc:
                 print(f"[codex-gateway] stagger ping failed for credential {index}: {exc}", file=sys.stderr)
 
