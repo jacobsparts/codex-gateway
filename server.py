@@ -35,6 +35,13 @@ REFRESH_TIMERS = {"quota": {}, "resets": {}}
 def _error(message: str, code: str = "invalid_request_error"):
     return {"error": {"message": message, "type": code, "code": code}}
 
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if isinstance(exc, getattr(transport, "CodexRateLimitError", ())):
+        return True
+    msg = str(exc).lower()
+    return "positive quota" in msg or "rate limit" in msg or "http 429" in msg
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -108,6 +115,9 @@ class Handler(BaseHTTPRequestHandler):
                     and model.get("slug")
                 ]
             except transport.CodexError as exc:
+                if _is_rate_limit_error(exc):
+                    self._send(429, _error(str(exc), "rate_limit_exceeded"))
+                    return
                 self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
                 return
             self._send(200, {"object": "list", "data": data})
@@ -152,30 +162,50 @@ class Handler(BaseHTTPRequestHandler):
             self._send(504, _error(f"codex stream stalled: {exc}", "transport_error"))
             return
         except transport.CodexError as exc:
+            if _is_rate_limit_error(exc):
+                self._send(429, _error(str(exc), "rate_limit_exceeded"))
+                return
             self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
             return
         self._send(200, response)
 
     def _stream_response(self, body: dict, auth: transport.CodexAuth) -> None:
         """Forward the upstream SSE stream."""
+        headers_sent = False
+
+        def ensure_headers() -> None:
+            nonlocal headers_sent
+            if not headers_sent:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                headers_sent = True
+
+        def write(event: dict) -> None:
+            ensure_headers()
+            self.wfile.write(f"event: {event.get('type')}\n".encode())
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            self.wfile.flush()
+
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-
-            def write(event: dict) -> None:
-                self.wfile.write(f"event: {event.get('type')}\n".encode())
-                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-                self.wfile.flush()
-
             transport.responses(body, auth=auth, on_event=write)
         except transport.CodexStallError as exc:
-            write({"type": "error", "message": f"codex stream stalled: {exc}"})
+            if not headers_sent:
+                self._send(504, _error(f"codex stream stalled: {exc}", "transport_error"))
+            else:
+                write({"type": "error", "message": f"codex stream stalled: {exc}"})
         except transport.CodexError as exc:
-            write({"type": "error", "message": f"codex transport failed: {exc}"})
-        self.close_connection = True
+            if not headers_sent:
+                if _is_rate_limit_error(exc):
+                    self._send(429, _error(str(exc), "rate_limit_exceeded"))
+                else:
+                    self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+            else:
+                write({"type": "error", "message": f"codex transport failed: {exc}"})
+        finally:
+            self.close_connection = True
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("[codex-gateway] %s - %s\n" % (self.address_string(), fmt % args))
@@ -206,6 +236,8 @@ def _backend_request(auth: transport.CodexAuth, url: str, data: bytes | None = N
             return json.load(response)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
+        if exc.code == 429:
+            raise transport.CodexRateLimitError(f"Codex backend request failed: HTTP {exc.code}: {detail}") from exc
         raise transport.CodexError(f"Codex backend request failed: HTTP {exc.code}: {detail}") from exc
     except (OSError, ValueError) as exc:
         raise transport.CodexError(f"Codex backend request failed: {exc}") from exc

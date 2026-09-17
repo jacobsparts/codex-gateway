@@ -58,6 +58,11 @@ class CodexError(Exception):
     pass
 
 
+class CodexRateLimitError(CodexError):
+    """Raised when rate limits or quotas are exhausted."""
+    pass
+
+
 class CredentialInvalidError(CodexError):
     """Raised when token refresh returns 401 and the credential is marked invalid."""
 
@@ -586,7 +591,7 @@ class CodexAuth:
             if selected is None:
                 detail = "; ".join(errors)
                 suffix = f": {detail}" if detail else ""
-                raise CodexError(f"No Codex credential has positive quota{suffix}")
+                raise CodexRateLimitError(f"No Codex credential has positive quota{suffix}")
             self._select_loaded(self.root, selected)
             return selected
 
@@ -1070,6 +1075,8 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts, on_event=Non
                 if attempt == 0:
                     auth.select_credential(timeout=timeouts.first_byte)
                     continue
+            if exc.code == 429:
+                raise CodexRateLimitError(f"Codex request failed: HTTP {exc.code}: {detail}") from exc
             raise CodexError(f"Codex request failed: HTTP {exc.code}: {detail}") from exc
         except CodexStallError:
             raise
