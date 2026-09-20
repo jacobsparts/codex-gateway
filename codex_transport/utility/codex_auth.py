@@ -28,7 +28,7 @@ MAX_WAIT_SECS = 15 * 60
 
 
 def _detect_codex_version() -> str:
-    return os.environ.get("CODEX_VERSION", "0.146.0").strip() or "0.146.0"
+    return os.environ.get("CODEX_VERSION", "0.155.1").strip() or "0.155.1"
 
 CODEX_VERSION = _detect_codex_version()
 USER_AGENT = f"codex_cli_rs/{CODEX_VERSION} ({platform.system()} {platform.machine()}) codex"

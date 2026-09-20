@@ -164,7 +164,7 @@ refreshes that account's state again afterward.
 | `CODEX_GATEWAY_URL` | `http://127.0.0.1:8932` | Gateway URL used by `codex-quota` |
 | `CODEX_ISSUER` | `https://auth.openai.com` | OAuth issuer used by `codex-auth` |
 | `CODEX_CLIENT_ID` | Codex CLI client ID | OAuth client ID used by `codex-auth` |
-| `CODEX_VERSION` | bundled fallback | Codex version advertised by `codex-auth` |
+| `CODEX_VERSION` | bundled fallback | Codex CLI version advertised to the upstream backend by the gateway and `codex-auth` |
 
 ## Python API
 
