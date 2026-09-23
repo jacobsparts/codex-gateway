@@ -23,7 +23,7 @@ GATEWAY_TOKEN = os.environ.get("CODEX_GATEWAY_TOKEN")
 RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 CONSUME_RESET_URL = RESET_CREDITS_URL + "/consume"
 QUOTA_REFRESH_INTERVAL = 60 * 60
-RESET_REFRESH_INTERVAL = 24 * 60 * 60
+RESET_REFRESH_INTERVAL = 12 * 60 * 60
 AUTO_RESET_BEFORE = 10 * 60
 AUTO_RESET_MIN_QUOTA_RESET = 24 * 60 * 60
 MAINTENANCE_INTERVAL = 60
@@ -251,41 +251,27 @@ def _auth_for_index(index: int) -> transport.CodexAuth:
     return auth
 
 
-def _persist_quota(index: int, snapshot: dict, reset_summary) -> None:
+def _persist_quota(index: int, snapshot: dict) -> None:
     auth = transport.CodexAuth()
     with auth._lock(transport.fcntl.LOCK_EX):
         root = auth._load_unlocked()
         credential = root["credentials"][index]
         credential["rate_limits"] = snapshot
-        if isinstance(reset_summary, dict):
-            resets = credential.get("reset_credits")
-            if not isinstance(resets, dict):
-                resets = {}
-                credential["reset_credits"] = resets
-            for name in ("available_count", "applicable_available_count"):
-                if name in reset_summary:
-                    resets[name] = reset_summary[name]
         auth._select_loaded(root, index)
         auth._save_unlocked()
-
 
 def _persist_resets(index: int, payload: dict) -> None:
     auth = transport.CodexAuth()
     with auth._lock(transport.fcntl.LOCK_EX):
         root = auth._load_unlocked()
         credential = root["credentials"][index]
-        previous = credential.get("reset_credits")
-        resets = {
+        credential["reset_credits"] = {
             "fetched_at": int(time.time()),
             "available_count": payload.get("available_count", 0),
             "credits": payload.get("credits", []),
         }
-        if isinstance(previous, dict) and "applicable_available_count" in previous:
-            resets["applicable_available_count"] = previous["applicable_available_count"]
-        credential["reset_credits"] = resets
         auth._select_loaded(root, index)
         auth._save_unlocked()
-
 
 def _refresh_quota_index(index: int) -> None:
     auth = _auth_for_index(index)
@@ -293,7 +279,7 @@ def _refresh_quota_index(index: int) -> None:
     snapshot = transport._quota_snapshot_from_usage(payload)
     if not snapshot["limits"]:
         raise transport.CodexError("Quota refresh returned no usable rate limits")
-    _persist_quota(index, snapshot, payload.get("rate_limit_reset_credits"))
+    _persist_quota(index, snapshot)
 
 
 def _refresh_reset_index(index: int) -> None:
@@ -351,7 +337,7 @@ def _consume_reset_index(index: int) -> None:
     _refresh_quota_index(index)
     REFRESH_TIMERS["quota"][index] = time.time()
     _refresh_reset_index(index)
-    REFRESH_TIMERS["resets"][index] = time.monotonic()
+    REFRESH_TIMERS["resets"][index] = time.time()
 
 
 def _available_resets(credential: dict, now: float) -> list[float]:
@@ -393,7 +379,6 @@ def _depleted_pool_reset_candidate(
     root: dict,
     indices: list[int],
     now: float,
-    require_applicable: bool = False,
 ) -> int | None:
     if not indices:
         return None
@@ -406,12 +391,6 @@ def _depleted_pool_reset_candidate(
     candidates = []
     for index in indices:
         credential = credentials[index]
-        resets = credential.get("reset_credits")
-        if (
-            require_applicable
-            and (not isinstance(resets, dict) or resets.get("applicable_available_count", 0) < 1)
-        ):
-            continue
         effective = transport._effective_quota(credential)
         if effective is None or effective[0] <= now + AUTO_RESET_MIN_QUOTA_RESET:
             continue
@@ -435,19 +414,14 @@ def _consume_automatic_reset(indices: list[int]) -> None:
             _refresh_quota_index(index)
             REFRESH_TIMERS["quota"][index] = time.time()
             _refresh_reset_index(index)
-            REFRESH_TIMERS["resets"][index] = time.monotonic()
+            REFRESH_TIMERS["resets"][index] = time.time()
         except transport.CodexError as exc:
             print(f"[codex-gateway] automatic reset refresh failed for credential {index}: {exc}", file=sys.stderr)
             continue
         credential = transport.CodexAuth().root["credentials"][index]
-        resets = credential.get("reset_credits")
-        if (
-            isinstance(resets, dict)
-            and resets.get("applicable_available_count", 0) > 0
-            and any(
-                expires_at <= time.time() + AUTO_RESET_BEFORE
-                for expires_at in _available_resets(credential, time.time())
-            )
+        if any(
+            expires_at <= time.time() + AUTO_RESET_BEFORE
+            for expires_at in _available_resets(credential, time.time())
         ):
             try:
                 _consume_reset_index(index)
@@ -479,7 +453,6 @@ def _consume_automatic_reset(indices: list[int]) -> None:
         auth.root,
         indices,
         time.time(),
-        require_applicable=True,
     )
     if candidate is None:
         return
@@ -488,7 +461,7 @@ def _consume_automatic_reset(indices: list[int]) -> None:
     except transport.CodexError as exc:
         print(f"[codex-gateway] automatic reset credit refresh failed for credential {candidate}: {exc}", file=sys.stderr)
         return
-    REFRESH_TIMERS["resets"][candidate] = time.monotonic()
+    REFRESH_TIMERS["resets"][candidate] = time.time()
 
     auth = transport.CodexAuth()
     indices = [index for index in indices if auth.root["credentials"][index].get("invalid") is not True]
@@ -496,7 +469,6 @@ def _consume_automatic_reset(indices: list[int]) -> None:
         auth.root,
         indices,
         time.time(),
-        require_applicable=True,
     ) != candidate:
         return
     try:
@@ -507,11 +479,15 @@ def _consume_automatic_reset(indices: list[int]) -> None:
 
 def refresh_reset_credits(force: bool = False, account: str | None = None) -> None:
     with MAINTENANCE_LOCK:
+        auth = transport.CodexAuth()
         indices = _refresh_indices(account)
-        now = time.monotonic()
+        now = time.time()
         error = None
         for index in indices:
-            if not force and now - REFRESH_TIMERS["resets"].get(index, 0.0) < RESET_REFRESH_INTERVAL:
+            resets = auth.root["credentials"][index].get("reset_credits")
+            fetched_at = resets.get("fetched_at", 0) if isinstance(resets, dict) else 0
+            last_refresh = max(REFRESH_TIMERS["resets"].get(index, 0), fetched_at)
+            if not force and now - last_refresh < RESET_REFRESH_INTERVAL:
                 continue
             try:
                 _refresh_reset_index(index)
@@ -519,7 +495,7 @@ def refresh_reset_credits(force: bool = False, account: str | None = None) -> No
                 error = exc
                 print(f"[codex-gateway] reset-credit refresh failed for credential {index}: {exc}", file=sys.stderr)
                 continue
-            REFRESH_TIMERS["resets"][index] = time.monotonic()
+            REFRESH_TIMERS["resets"][index] = time.time()
         _consume_automatic_reset(indices)
         if account is not None and error is not None:
             raise error
