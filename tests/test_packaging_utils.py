@@ -28,8 +28,9 @@ def _version_tuple(value):
 
 
 def test_bundled_client_version_supports_gpt_6_astra():
-    # The upstream model catalog declares 0.153.0 as gpt-6-astra's minimum.
-    assert _version_tuple(codex.DEFAULT_CLIENT_VERSION) >= (0, 153, 0)
+    # The upstream model catalog declares 0.153.0 as gpt-6-astra's minimum,
+    # and 0.159.0 as gpt-6.1-sol's minimum.
+    assert _version_tuple(codex.DEFAULT_CLIENT_VERSION) >= (0, 159, 0)
     assert codex.CLIENT_VERSION == codex_auth.CODEX_VERSION
 
 
