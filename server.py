@@ -152,8 +152,8 @@ class Handler(BaseHTTPRequestHandler):
         if not body.get("model"):
             body = dict(body, model=transport.MODEL)
 
-        auth = transport.CodexAuth()
         try:
+            auth = transport.CodexAuth()
             if body.get("stream"):
                 self._stream_response(body, auth)
                 return
@@ -166,6 +166,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(429, _error(str(exc), "rate_limit_exceeded"))
                 return
             self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+            return
+        except ValueError as exc:
+            self._send(400, _error(str(exc)))
+            return
+        except Exception as exc:  # never drop the socket without a response
+            print(f"[codex-gateway] unhandled request error: {exc!r}", file=sys.stderr)
+            self._send(500, _error("internal gateway error", "internal_error"))
             return
         self._send(200, response)
 
@@ -204,6 +211,17 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
             else:
                 write({"type": "error", "message": f"codex transport failed: {exc}"})
+        except ValueError as exc:
+            if not headers_sent:
+                self._send(400, _error(str(exc)))
+            else:
+                write({"type": "error", "message": str(exc)})
+        except Exception as exc:  # never drop the socket without a response
+            print(f"[codex-gateway] unhandled stream error: {exc!r}", file=sys.stderr)
+            if not headers_sent:
+                self._send(500, _error("internal gateway error", "internal_error"))
+            else:
+                write({"type": "error", "message": "internal gateway error"})
         finally:
             self.close_connection = True
 

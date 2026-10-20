@@ -1119,11 +1119,15 @@ def responses(
     model = body.get("model")
     if not isinstance(model, str) or not model:
         raise ValueError("model is required")
-    if not isinstance(body.get("input"), list) or not body["input"]:
-        raise ValueError("input must be a non-empty list")
+    input_value = body.get("input")
+    if isinstance(input_value, str):
+        # The Responses API accepts a bare string; normalize it to a user message.
+        input_value = [{"role": "user", "content": input_value}] if input_value else []
+    if not isinstance(input_value, list) or not input_value:
+        raise ValueError("input must be a non-empty list or string")
     request_body = dict(body)
     request_body.pop("prompt_cache_options", None)
-    request_body["input"] = copy.deepcopy(body["input"])
+    request_body["input"] = copy.deepcopy(input_value)
     request_body.setdefault("instructions", "")
     for item in request_body["input"]:
         if not isinstance(item, dict):

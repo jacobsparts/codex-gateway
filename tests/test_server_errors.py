@@ -69,3 +69,47 @@ def test_post_responses_rate_limit_streaming():
     assert "positive quota" in sent["payload"]["error"]["message"]
     # Verify 200 was never sent
     assert 200 not in headers_called
+
+def test_post_responses_empty_input_returns_400():
+    handler = object.__new__(server.Handler)
+    handler.path = "/v1/responses"
+    handler.headers = {}
+    sent = {}
+
+    def fake_send(status, payload):
+        sent["status"] = status
+        sent["payload"] = payload
+
+    handler._send = fake_send
+    handler._authorized = lambda: True
+    handler._read_body = lambda: {"model": "gpt-6.1-sol", "input": []}
+
+    with patch("codex_transport.codex.CodexAuth"):
+        handler.do_POST()
+
+    assert sent["status"] == 400
+    assert "input" in sent["payload"]["error"]["message"]
+
+
+def test_post_responses_unexpected_error_returns_500():
+    handler = object.__new__(server.Handler)
+    handler.path = "/v1/responses"
+    handler.headers = {}
+    sent = {}
+
+    def fake_send(status, payload):
+        sent["status"] = status
+        sent["payload"] = payload
+
+    handler._send = fake_send
+    handler._authorized = lambda: True
+    handler._read_body = lambda: {"model": "gpt-6.1-sol", "input": [{"role": "user", "content": "hi"}]}
+
+    with patch("codex_transport.codex.CodexAuth"), patch(
+        "codex_transport.codex.responses",
+        side_effect=RuntimeError("boom"),
+    ):
+        handler.do_POST()
+
+    assert sent["status"] == 500
+    assert sent["payload"]["error"]["code"] == "internal_error"
