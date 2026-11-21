@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -27,6 +28,8 @@ RESET_REFRESH_INTERVAL = 12 * 60 * 60
 AUTO_RESET_BEFORE = 10 * 60
 AUTO_RESET_MIN_QUOTA_RESET = 24 * 60 * 60
 MAINTENANCE_INTERVAL = 60
+VERSION_REFRESH_INTERVAL = 24 * 60 * 60
+VERSION_LAST_CHECK = None
 
 MAINTENANCE_LOCK = threading.Lock()
 REFRESH_TIMERS = {"quota": {}, "resets": {}}
@@ -90,7 +93,7 @@ class Handler(BaseHTTPRequestHandler):
                     refresh_reset_credits(force=True, account=account)
                 snapshots = _usage(transport.CodexAuth(), account=account)
             except transport.CodexError as exc:
-                self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+                self._send(502, _error(str(exc), "transport_error"))
                 return
             self._send(200, {"object": "list", "data": snapshots})
             return
@@ -118,7 +121,7 @@ class Handler(BaseHTTPRequestHandler):
                 if _is_rate_limit_error(exc):
                     self._send(429, _error(str(exc), "rate_limit_exceeded"))
                     return
-                self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+                self._send(502, _error(str(exc), "transport_error"))
                 return
             self._send(200, {"object": "list", "data": data})
             return
@@ -138,7 +141,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 snapshots = _consume_reset(body["account"])
             except transport.CodexError as exc:
-                self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+                self._send(502, _error(str(exc), "transport_error"))
                 return
             self._send(200, {"object": "list", "data": snapshots})
             return
@@ -165,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
             if _is_rate_limit_error(exc):
                 self._send(429, _error(str(exc), "rate_limit_exceeded"))
                 return
-            self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+            self._send(502, _error(str(exc), "transport_error"))
             return
         except ValueError as exc:
             self._send(400, _error(str(exc)))
@@ -208,9 +211,9 @@ class Handler(BaseHTTPRequestHandler):
                 if _is_rate_limit_error(exc):
                     self._send(429, _error(str(exc), "rate_limit_exceeded"))
                 else:
-                    self._send(502, _error(f"codex transport failed: {exc}", "transport_error"))
+                    self._send(502, _error(str(exc), "transport_error"))
             else:
-                write({"type": "error", "message": f"codex transport failed: {exc}"})
+                write({"type": "error", "message": str(exc)})
         except ValueError as exc:
             if not headers_sent:
                 self._send(400, _error(str(exc)))
@@ -546,9 +549,31 @@ def _consume_reset(account: str) -> list[dict]:
     return _usage(transport.CodexAuth(), account=account)
 
 
+def refresh_client_version() -> None:
+    global VERSION_LAST_CHECK
+    if os.environ.get("CODEX_VERSION", "").strip():
+        return
+    now = time.monotonic()
+    if VERSION_LAST_CHECK is not None and now - VERSION_LAST_CHECK < VERSION_REFRESH_INTERVAL:
+        return
+    VERSION_LAST_CHECK = now
+    try:
+        with urllib.request.urlopen("https://registry.npmjs.org/@openai/codex/latest", timeout=10) as response:
+            payload = json.load(response)
+        version = payload.get("version") if isinstance(payload, dict) else None
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            raise ValueError("npm returned an invalid stable Codex version")
+    except (OSError, ValueError) as exc:
+        print(f"[codex-gateway] version refresh failed: {exc}", file=sys.stderr)
+        return
+    if version != transport.CLIENT_VERSION:
+        transport.CLIENT_VERSION = version
+        print(f"[codex-gateway] Codex client version updated to {version}", file=sys.stderr)
+
+
 def _maintenance_loop() -> None:
     while True:
-        for refresh in (refresh_quota, refresh_reset_credits):
+        for refresh in (refresh_client_version, refresh_quota, refresh_reset_credits):
             try:
                 refresh()
             except transport.CodexError as exc:

@@ -27,7 +27,7 @@ RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_CLIENT_VERSION = "0.160.0"
+DEFAULT_CLIENT_VERSION = "0.171.0"
 CLIENT_VERSION = os.environ.get("CODEX_VERSION", DEFAULT_CLIENT_VERSION).strip() or DEFAULT_CLIENT_VERSION
 MODEL = "gpt-5.6-luna"
 DEFAULT_FIRST_BYTE_TIMEOUT = 60.0
@@ -1077,8 +1077,8 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts, on_event=Non
                     auth.select_credential(timeout=timeouts.first_byte)
                     continue
             if exc.code == 429:
-                raise CodexRateLimitError(f"Codex request failed: HTTP {exc.code}: {detail}") from exc
-            raise CodexError(f"Codex request failed: HTTP {exc.code}: {detail}") from exc
+                raise CodexRateLimitError(detail or f"HTTP {exc.code} {exc.reason}") from exc
+            raise CodexError(detail or f"HTTP {exc.code} {exc.reason}") from exc
         except CodexStallError:
             raise
         except urllib.error.URLError as exc:
@@ -1091,7 +1091,7 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts, on_event=Non
                     idle_timeout=timeouts.first_byte,
                     last_event_type=None,
                 ) from exc
-            raise CodexError(f"Codex request failed: {reason}") from exc
+            raise CodexError(str(reason)) from exc
         except (TimeoutError, socket.timeout) as exc:
             raise CodexStallError(
                 f"Codex SSE stalled during first_byte after {timeouts.first_byte:g}s idle "

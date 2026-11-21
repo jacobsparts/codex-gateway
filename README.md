@@ -164,7 +164,13 @@ refreshes that account's state again afterward.
 | `CODEX_GATEWAY_URL` | `http://127.0.0.1:8932` | Gateway URL used by `codex-quota` |
 | `CODEX_ISSUER` | `https://auth.openai.com` | OAuth issuer used by `codex-auth` |
 | `CODEX_CLIENT_ID` | Codex CLI client ID | OAuth client ID used by `codex-auth` |
-| `CODEX_VERSION` | bundled fallback | Codex CLI version advertised to the upstream backend by the gateway and `codex-auth` |
+| `CODEX_VERSION` | auto (gateway), bundled fallback (utilities) | Pin the advertised Codex CLI version; disables automatic npm version checks in the gateway |
+
+The gateway checks npm for the latest stable `@openai/codex` version at startup
+in background maintenance and every 24 hours. Updates apply to model enumeration
+and upstream request headers without a restart; no packages are installed. If npm
+is unavailable, it keeps the current version (the bundled fallback on startup).
+Set `CODEX_VERSION` to pin a version and disable these checks.
 
 ## Python API
 
