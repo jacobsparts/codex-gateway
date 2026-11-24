@@ -27,6 +27,54 @@ def test_upstream_error_has_no_wrapper(stream, detail):
     handler._send.assert_called_once_with(502, server._error(expected, "transport_error"))
 
 
+@pytest.fixture(autouse=True)
+def isolate_version_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "VERSION_CACHE_FILE", str(tmp_path / "cache" / "client-version"))
+
+
+@pytest.mark.parametrize("current, offered, expected", [
+    ("0.171.0", "0.160.0", "0.171.0"),
+    ("0.171.0", "0.171.0", "0.171.0"),
+    ("0.99.0", "0.100.0", "0.100.0"),
+])
+def test_version_refresh_only_moves_forward(monkeypatch, current, offered, expected):
+    monkeypatch.delenv("CODEX_VERSION", raising=False)
+    monkeypatch.setattr(server, "VERSION_LAST_CHECK", None)
+    monkeypatch.setattr(transport, "CLIENT_VERSION", current)
+    with patch.object(server.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps({"version": offered}).encode())):
+        server.refresh_client_version()
+    assert transport.CLIENT_VERSION == expected
+
+
+def test_version_survives_restart_and_offline_check(monkeypatch):
+    monkeypatch.delenv("CODEX_VERSION", raising=False)
+    monkeypatch.setattr(server, "VERSION_LAST_CHECK", None)
+    monkeypatch.setattr(transport, "CLIENT_VERSION", "0.171.0")
+    server._save_client_version("0.200.0")
+    server._load_client_version()
+    assert transport.CLIENT_VERSION == "0.200.0"
+    with patch.object(server.urllib.request, "urlopen", side_effect=OSError("offline")):
+        server.refresh_client_version()
+    assert transport.CLIENT_VERSION == "0.200.0"
+
+
+@pytest.mark.parametrize("cached", ["0.160.0", "invalid"])
+def test_cache_cannot_lower_version(monkeypatch, cached):
+    monkeypatch.delenv("CODEX_VERSION", raising=False)
+    monkeypatch.setattr(transport, "CLIENT_VERSION", "0.171.0")
+    server._save_client_version(cached)
+    server._load_client_version()
+    assert transport.CLIENT_VERSION == "0.171.0"
+
+
+def test_pin_ignores_cached_version(monkeypatch):
+    monkeypatch.setenv("CODEX_VERSION", "0.160.0")
+    monkeypatch.setattr(transport, "CLIENT_VERSION", "0.160.0")
+    server._save_client_version("0.200.0")
+    server._load_client_version()
+    assert transport.CLIENT_VERSION == "0.160.0"
+
+
 def test_client_version_refresh_daily(monkeypatch):
     monkeypatch.delenv("CODEX_VERSION", raising=False)
     monkeypatch.setattr(server, "VERSION_LAST_CHECK", None)

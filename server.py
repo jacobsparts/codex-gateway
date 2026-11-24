@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -30,6 +31,10 @@ AUTO_RESET_MIN_QUOTA_RESET = 24 * 60 * 60
 MAINTENANCE_INTERVAL = 60
 VERSION_REFRESH_INTERVAL = 24 * 60 * 60
 VERSION_LAST_CHECK = None
+VERSION_CACHE_FILE = os.path.join(
+    os.path.expanduser(os.environ.get("XDG_CACHE_HOME", "~/.cache")),
+    "codex-gateway", "client-version",
+)
 
 MAINTENANCE_LOCK = threading.Lock()
 REFRESH_TIMERS = {"quota": {}, "resets": {}}
@@ -549,6 +554,38 @@ def _consume_reset(account: str) -> list[dict]:
     return _usage(transport.CodexAuth(), account=account)
 
 
+def _load_client_version() -> None:
+    if os.environ.get("CODEX_VERSION", "").strip():
+        return
+    try:
+        with open(VERSION_CACHE_FILE, encoding="utf-8") as stream:
+            version = stream.read().strip()
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) and (
+            tuple(map(int, version.split("."))) > tuple(map(int, transport.CLIENT_VERSION.split(".")))
+        ):
+            transport.CLIENT_VERSION = version
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[codex-gateway] version cache read failed: {exc}", file=sys.stderr)
+
+
+def _save_client_version(version: str) -> None:
+    temporary = None
+    try:
+        directory = os.path.dirname(VERSION_CACHE_FILE)
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as stream:
+            temporary = stream.name
+            stream.write(version + "\n")
+        os.replace(temporary, VERSION_CACHE_FILE)
+    except OSError as exc:
+        print(f"[codex-gateway] version cache write failed: {exc}", file=sys.stderr)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def refresh_client_version() -> None:
     global VERSION_LAST_CHECK
     if os.environ.get("CODEX_VERSION", "").strip():
@@ -566,7 +603,8 @@ def refresh_client_version() -> None:
     except (OSError, ValueError) as exc:
         print(f"[codex-gateway] version refresh failed: {exc}", file=sys.stderr)
         return
-    if version != transport.CLIENT_VERSION:
+    if tuple(map(int, version.split("."))) > tuple(map(int, transport.CLIENT_VERSION.split("."))):
+        _save_client_version(version)
         transport.CLIENT_VERSION = version
         print(f"[codex-gateway] Codex client version updated to {version}", file=sys.stderr)
 
@@ -614,6 +652,9 @@ def _stagger_loop() -> None:
 
 def main() -> None:
     server = ThreadingHTTPServer((DEFAULT_HOST, DEFAULT_PORT), Handler)
+    _load_client_version()
+    if not os.environ.get("CODEX_VERSION", "").strip():
+        _save_client_version(transport.CLIENT_VERSION)
     threading.Thread(target=_maintenance_loop, name="codex-maintenance", daemon=True).start()
     threading.Thread(target=_stagger_loop, name="codex-stagger", daemon=True).start()
     print(
